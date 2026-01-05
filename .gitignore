@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+
+# State files (contain chat IDs)
+.bridge-state.json
+health.json
+messages.json
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/

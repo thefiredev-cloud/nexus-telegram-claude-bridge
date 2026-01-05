@@ -1,0 +1,16 @@
+{
+  "name": "telegram-claude-bridge",
+  "version": "1.0.0",
+  "description": "Simple Telegram to Claude Code bridge for Windows",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js",
+    "setup": "node setup.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.76",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "express": "^5.2.1"
+  }
+}
