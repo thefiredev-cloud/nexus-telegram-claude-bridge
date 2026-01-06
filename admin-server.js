@@ -139,8 +139,8 @@ const strictLimiter = rateLimit({
 
 // Authentication middleware
 const authMiddleware = (req, res, next) => {
-    // Skip auth for login endpoint
-    if (req.path === '/api/login') {
+    // Skip auth for login endpoint (path is relative to /api mount point)
+    if (req.path === '/login') {
         return next();
     }
 
@@ -159,8 +159,8 @@ const authMiddleware = (req, res, next) => {
 // CSRF middleware for state-changing requests
 const csrfMiddleware = (req, res, next) => {
     if (req.method === 'POST' || req.method === 'DELETE') {
-        // Skip for login
-        if (req.path === '/api/login') {
+        // Skip for login (path is relative to /api mount point)
+        if (req.path === '/login') {
             return next();
         }
 
