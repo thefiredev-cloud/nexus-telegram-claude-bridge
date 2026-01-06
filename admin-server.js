@@ -119,19 +119,19 @@ app.use(helmet({
 app.use(cookieParser());
 app.use(express.json());
 
-// General rate limiting - 100 requests per 15 minutes
+// General rate limiting - 200 requests per minute (local tool)
 const generalLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
+    windowMs: 1 * 60 * 1000,
+    max: 200,
     message: { error: 'Too many requests, please try again later.' },
     standardHeaders: true,
     legacyHeaders: false
 });
 
-// Strict rate limiting for sensitive endpoints - 10 requests per 15 minutes
+// Strict rate limiting for sensitive endpoints - 30 requests per minute
 const strictLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 10,
+    windowMs: 1 * 60 * 1000,
+    max: 30,
     message: { error: 'Too many attempts. Please wait.' },
     standardHeaders: true,
     legacyHeaders: false
