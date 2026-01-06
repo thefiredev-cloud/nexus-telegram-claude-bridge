@@ -10,8 +10,8 @@
  * Domain Modes:
  * - /finance - Quant analysis, markets, economics
  * - /dev - Full-stack development
- * - /legal - Legal tech, JudgeFinder, SEC compliance
- * - /health - EMS/healthcare, Protocol Guide
+ * - /legal - Legal tech, SEC compliance
+ * - /health - EMS/healthcare
  * - /judge - Judicial analytics
  */
 
@@ -24,9 +24,102 @@ const { query } = require('@anthropic-ai/claude-agent-sdk');
 // Configuration
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ALLOWED_CHAT_IDS = (process.env.TELEGRAM_ALLOWED_CHAT_IDS || '').split(',').filter(Boolean);
-let WORKING_DIR = process.env.WORKING_DIR || 'C:\\Users\\Tanner';
+let WORKING_DIR = process.env.WORKING_DIR || path.resolve('.');
 const TIMEOUT_MINUTES = 10;
 const MAX_PARALLEL_AGENTS = 10;
+
+// Security: Directory whitelist for /cd command
+// Configure via ALLOWED_DIRECTORIES env var (semicolon-separated paths)
+// If not set, only WORKING_DIR is allowed
+const ALLOWED_DIRECTORIES = (process.env.ALLOWED_DIRECTORIES || '')
+    .split(';')
+    .map(p => p.trim())
+    .filter(Boolean);
+
+// If no directories configured, allow only the working directory
+if (ALLOWED_DIRECTORIES.length === 0) {
+    ALLOWED_DIRECTORIES.push(WORKING_DIR);
+}
+
+// Check if a path is within allowed directories
+function isPathAllowed(targetPath) {
+    try {
+        const normalizedTarget = path.resolve(targetPath).toLowerCase();
+        return ALLOWED_DIRECTORIES.some(allowed => {
+            const normalizedAllowed = path.resolve(allowed).toLowerCase();
+            return normalizedTarget === normalizedAllowed ||
+                   normalizedTarget.startsWith(normalizedAllowed + path.sep.toLowerCase());
+        });
+    } catch (e) {
+        return false;
+    }
+}
+
+// Retry configuration
+const RETRY_CONFIG = {
+    maxRetries: 3,
+    baseDelay: 1000,
+    maxDelay: 30000,
+    retryableErrors: ['429', '529', 'ECONNRESET', 'overloaded', 'rate_limit']
+};
+
+// Exponential backoff retry wrapper
+async function withRetry(fn, options = {}) {
+    const { maxRetries = RETRY_CONFIG.maxRetries, baseDelay = RETRY_CONFIG.baseDelay, maxDelay = RETRY_CONFIG.maxDelay } = options;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (error) {
+            const errorStr = String(error.message || error).toLowerCase();
+            const isRetryable = RETRY_CONFIG.retryableErrors.some(e => errorStr.includes(e.toLowerCase()));
+
+            if (!isRetryable || attempt === maxRetries) {
+                throw error;
+            }
+
+            // Exponential backoff with jitter
+            const delay = Math.min(baseDelay * Math.pow(2, attempt) + Math.random() * 1000, maxDelay);
+            log('WARN', `Retry ${attempt + 1}/${maxRetries} after ${Math.round(delay)}ms: ${error.message}`);
+            await new Promise(r => setTimeout(r, delay));
+        }
+    }
+}
+
+// Log rotation configuration
+const LOG_ROTATION = {
+    maxSize: 5 * 1024 * 1024, // 5MB
+    maxFiles: 5
+};
+
+// Rotate log files when they exceed max size
+function rotateLogsIfNeeded() {
+    try {
+        if (!fs.existsSync(LOG_FILE)) return;
+
+        const stats = fs.statSync(LOG_FILE);
+        if (stats.size < LOG_ROTATION.maxSize) return;
+
+        // Rotate: bridge.log.4 -> bridge.log.5, bridge.log.3 -> bridge.log.4, etc.
+        for (let i = LOG_ROTATION.maxFiles - 1; i >= 1; i--) {
+            const oldFile = `${LOG_FILE}.${i}`;
+            const newFile = `${LOG_FILE}.${i + 1}`;
+            if (fs.existsSync(oldFile)) {
+                if (i === LOG_ROTATION.maxFiles - 1) {
+                    fs.unlinkSync(oldFile); // Delete oldest
+                } else {
+                    fs.renameSync(oldFile, newFile);
+                }
+            }
+        }
+
+        // bridge.log -> bridge.log.1
+        fs.renameSync(LOG_FILE, `${LOG_FILE}.1`);
+        log('INFO', 'Log file rotated');
+    } catch (e) {
+        console.error('Log rotation error:', e.message);
+    }
+}
 
 // State files
 const STATE_FILE = path.join(__dirname, '.bridge-state.json');
@@ -153,6 +246,25 @@ function saveMessage(msg) {
     }
 }
 
+// Build conversation context from recent messages
+function buildConversationContext(limit = 10, maxCharsPerMsg = 500) {
+    try {
+        const messages = loadMessages();
+        if (messages.length === 0) return '';
+
+        const recent = messages.slice(-limit);
+        const context = recent.map(m => {
+            const prompt = (m.prompt || '').substring(0, maxCharsPerMsg);
+            const response = (m.response || '').substring(0, maxCharsPerMsg);
+            return `User: ${prompt}\nAssistant: ${response}`;
+        }).join('\n\n');
+
+        return `\n\n--- Recent Conversation Context ---\n${context}\n--- End Context ---\n`;
+    } catch (e) {
+        return '';
+    }
+}
+
 // Token tracking (Opus 4.5 pricing: $15/MTok input, $75/MTok output)
 const TOKEN_COSTS = {
     inputPer1M: 15.00,
@@ -211,6 +323,7 @@ const API_BASE = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 // Logging
 const LOG_FILE = path.join(__dirname, 'bridge.log');
+let logCounter = 0;
 function log(level, message, data = '') {
     const timestamp = new Date().toISOString();
     const line = `[${timestamp}] [${level}] ${message} ${data}`;
@@ -218,6 +331,13 @@ function log(level, message, data = '') {
     fs.appendFileSync(LOG_FILE, line + '\n');
     if (level === 'ERROR') stats.errors++;
     stats.lastActivity = Date.now();
+
+    // Check for log rotation every 100 log entries
+    logCounter++;
+    if (logCounter >= 100) {
+        logCounter = 0;
+        rotateLogsIfNeeded();
+    }
 }
 
 // ============================================
@@ -329,69 +449,39 @@ Be precise with numbers and always cite data sources when possible.`,
 Write clean, production-ready code. Explain architectural decisions.
 Format code blocks properly but avoid markdown tables.`,
 
-    legal: `You are a legal technology expert working on JudgeFinder - a judicial analytics platform.
-
-Your expertise includes:
+    legal: `You are a legal technology expert with expertise in:
 - Judicial behavior analysis and prediction
-- Court data analytics (California courts, expanding nationally)
-- CourtListener and UniCourt API integration
-- Legal tech SaaS architecture (Next.js 15, Supabase, Stripe, Clerk)
-- SEC compliance (Rule 506(c), Form D, accredited investor verification)
+- Court data analytics and legal research
+- Legal tech SaaS architecture
+- SEC compliance and regulatory filings
 - Subscription agreement drafting and review
-- Legal tech product development and pricing strategy
-
-JudgeFinder context:
-- 1,800+ judge profiles in California
-- 175+ API endpoints
-- Three-tier subscription ($29/mo Pro, $299/mo Enterprise)
-- B2B legal advertising platform
-- 40+ database tables with normalized court data
+- Legal tech product development
 
 Format responses professionally. Cite legal sources when applicable.
 Avoid markdown tables - use bullet points instead.`,
 
-    health: `You are a healthcare technology expert specializing in EMS (Emergency Medical Services) applications.
+    health: `You are a healthcare technology expert specializing in medical applications.
 
 Your expertise includes:
-- LA County Prehospital Care Manual (PCM) protocols
-- Paramedic decision support systems
+- EMS protocols and prehospital care
+- Medical decision support systems
 - Pediatric dosing calculations (weight-based)
-- Medical knowledge base design (BM25 retrieval, MiniSearch)
+- Medical knowledge base design
 - PWA development for offline-first medical apps
 - HIPAA compliance and medical data security
-- OpenAI GPT-4o integration for medical Q&A
-
-Protocol Guide context:
-- AI-powered EMS protocol assistant for LA County Fire
-- 3,200+ paramedics across 174 fire stations
-- 450,000 annual EMS calls
-- 810-line medical knowledge base
-- Offline-capable PWA with 11MB cached data
-- Voice input for hands-free operation
 
 Be precise with medical information. Always emphasize following local protocols.
 Format responses clearly without markdown tables.`,
 
-    judge: `You are an expert on JudgeFinder - a judicial analytics and transparency platform.
+    judge: `You are an expert on judicial analytics and court data.
 
 Key capabilities:
-- Search 1,800+ California judge profiles
 - Analyze judicial behavior patterns and case outcomes
 - Access civil, criminal, and family law metrics
-- Multi-dimensional bias detection analysis
 - Court and jurisdiction data lookup
 - Case analytics and outcome predictions
 
-Technical details:
-- Next.js 15.5 with React 18.3
-- Supabase PostgreSQL database
-- Clerk authentication with SSO
-- Stripe billing integration
-- 175+ REST API endpoints
-- Real-time data updates
-
-Help users understand judicial patterns, search for judges, analyze court data,
-and leverage the platform's analytics features.
+Help users understand judicial patterns, search for judges, and analyze court data.
 Format responses cleanly without markdown tables.`,
 
     default: `Format responses cleanly for Telegram. Avoid markdown tables - use bullet points or plain text instead. Keep responses focused and well-structured.`
@@ -401,7 +491,7 @@ Format responses cleanly without markdown tables.`,
 // CLAUDE SDK EXECUTION
 // ============================================
 
-async function runClaude(prompt, chatId, mode = 'default') {
+async function runClaude(prompt, chatId, mode = 'default', includeContext = true) {
     log('INFO', `Running Claude (${mode}): "${prompt.substring(0, 80)}..."`);
     updateHealth({ status: 'processing' });
     isProcessing = true;
@@ -412,22 +502,36 @@ async function runClaude(prompt, chatId, mode = 'default') {
 
     try {
         const systemPrompt = SYSTEM_PROMPTS[mode] || SYSTEM_PROMPTS.default;
-        const fullPrompt = `${systemPrompt}\n\n---\n\nUser request: ${prompt}`;
+        const conversationContext = includeContext ? buildConversationContext(5) : '';
+        const fullPrompt = `${systemPrompt}${conversationContext}\n\n---\n\nUser request: ${prompt}`;
 
-        let result = '';
-        for await (const message of query({
-            prompt: fullPrompt,
-            options: {
-                cwd: WORKING_DIR,
-                allowedTools: ["Read", "Edit", "Bash", "Write", "Glob", "Grep", "WebFetch", "WebSearch"],
-                permissionMode: "bypassPermissions",
+        // Create timeout promise
+        const timeoutMs = TIMEOUT_MINUTES * 60 * 1000;
+        const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`Query timed out after ${TIMEOUT_MINUTES} minutes`)), timeoutMs)
+        );
+
+        // Wrap the query in retry logic
+        const queryPromise = withRetry(async () => {
+            let result = '';
+            for await (const message of query({
+                prompt: fullPrompt,
+                options: {
+                    cwd: WORKING_DIR,
+                    allowedTools: ["Read", "Edit", "Bash", "Write", "Glob", "Grep", "WebFetch", "WebSearch"],
+                    permissionMode: "default",
+                }
+            })) {
+                if ("result" in message) {
+                    result = message.result;
+                }
+                sendTyping(chatId);
             }
-        })) {
-            if ("result" in message) {
-                result = message.result;
-            }
-            sendTyping(chatId);
-        }
+            return result;
+        });
+
+        // Race between query and timeout
+        const result = await Promise.race([queryPromise, timeoutPromise]);
 
         // Track token usage
         const inputTokens = estimateTokens(fullPrompt);
@@ -478,7 +582,7 @@ async function runParallelAgents(prompts, chatId, mode = 'default') {
                     options: {
                         cwd: WORKING_DIR,
                         allowedTools: ["Read", "Edit", "Bash", "Write", "Glob", "Grep", "WebFetch", "WebSearch"],
-                        permissionMode: "bypassPermissions",
+                        permissionMode: "default",
                     }
                 })) {
                     if ("result" in message) {
@@ -549,8 +653,8 @@ async function processMessage(message) {
             `<b>Domain Modes:</b>\n` +
             `• /finance [q] - Quant/market analysis\n` +
             `• /dev [q] - Full-stack development\n` +
-            `• /legal [q] - Legal tech (JudgeFinder)\n` +
-            `• /health [q] - EMS/healthcare (Protocol Guide)\n` +
+            `• /legal [q] - Legal tech\n` +
+            `• /health [q] - Healthcare/EMS\n` +
             `• /judge [q] - Judicial analytics\n\n` +
             `<b>Power Features:</b>\n` +
             `• /agents [N] [q] - Run N parallel agents\n` +
@@ -609,13 +713,18 @@ async function processMessage(message) {
 
     if (text.startsWith('/cd ')) {
         const newDir = text.substring(4).trim();
-        if (fs.existsSync(newDir)) {
-            WORKING_DIR = newDir;
-            process.env.WORKING_DIR = newDir;
-            await sendMessage(chatId, `Changed to: <code>${newDir}</code>`);
-        } else {
+        if (!fs.existsSync(newDir)) {
             await sendMessage(chatId, `Not found: ${newDir}`);
+            return;
         }
+        if (!isPathAllowed(newDir)) {
+            await sendMessage(chatId, `Access denied. Allowed directories:\n${ALLOWED_DIRECTORIES.map(d => `• ${d}`).join('\n')}`);
+            log('WARN', `Blocked /cd to: ${newDir}`);
+            return;
+        }
+        WORKING_DIR = newDir;
+        process.env.WORKING_DIR = newDir;
+        await sendMessage(chatId, `Changed to: <code>${newDir}</code>`);
         return;
     }
 
@@ -661,11 +770,11 @@ async function processMessage(message) {
         return;
     }
 
-    // ===== LEGAL MODE (JudgeFinder) =====
+    // ===== LEGAL MODE =====
     if (text.startsWith('/legal ')) {
         const prompt = text.substring(7).trim();
         if (!prompt) {
-            await sendMessage(chatId, 'Usage: /legal [query]\nExpert in legal tech, JudgeFinder, SEC compliance.');
+            await sendMessage(chatId, 'Usage: /legal [query]\nExpert in legal tech and SEC compliance.');
             return;
         }
 
@@ -682,11 +791,11 @@ async function processMessage(message) {
         return;
     }
 
-    // ===== HEALTH/EMS MODE (Protocol Guide) =====
+    // ===== HEALTH/EMS MODE =====
     if (text.startsWith('/health ')) {
         const prompt = text.substring(8).trim();
         if (!prompt) {
-            await sendMessage(chatId, 'Usage: /health [query]\nEMS protocols, Protocol Guide, paramedic support.');
+            await sendMessage(chatId, 'Usage: /health [query]\nEMS protocols and healthcare support.');
             return;
         }
 
@@ -703,7 +812,7 @@ async function processMessage(message) {
         return;
     }
 
-    // ===== JUDGE MODE (JudgeFinder Analytics) =====
+    // ===== JUDGE MODE =====
     if (text.startsWith('/judge ')) {
         const prompt = text.substring(7).trim();
         if (!prompt) {

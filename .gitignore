@@ -1,17 +1,32 @@
 # Dependencies
 node_modules/
 
-# Environment
+# Environment & Secrets
 .env
+.admin-token
 
 # State files (contain chat IDs)
 .bridge-state.json
 health.json
 messages.json
+watchdog-health.json
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
 
 # Logs
 *.log
+logs/
+
+# Generated scripts (contain local paths)
+run-watchdog-hidden.vbs
 
 # IDE
 .vscode/
 .idea/
+
+# OS
+.DS_Store
+Thumbs.db
